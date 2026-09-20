@@ -1,0 +1,31 @@
+# Secrets and API keys (must never be committed)
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+
+# Python cache
+*.py[cod]
+__pycache__/
+
+# Reflex build/state
+.states
+.web
+assets/external/
+
+# Databases and AI model caches
+*.db
+rag_db/
+rerank_cache/
+
+# Personal documents (CV, transcript, test files)
+uploaded_files/
+test_files/
+
+# Generated outputs and local artifacts
+*_draft.pdf
+*_output.pdf
+reflex.lock/
