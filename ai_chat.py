@@ -115,3 +115,31 @@ Respond with a clear, concise answer (2-5 sentences). Mention which document(s) 
 
     except Exception as e:
         return {"success": False, "error": f"Multi-document chat answer failed: {str(e)}"}
+
+def answer_voice_question(document_text: str, audio_bytes: bytes, history: list[dict] = None) -> dict:
+    """Answer a question spoken in a WAV voice note. Replies in text."""
+    try:
+        from google.genai import types
+
+        history_text = ""
+        for turn in (history or [])[-6:]:
+            q = turn.get("question") or "(voice note)"
+            history_text += f"User: {q}\nAssistant: {turn.get('answer', '')}\n"
+
+        prompt = (
+            "You are AdminAgent, a helpful assistant that answers questions about a document.\n"
+            "The user's question is spoken in the attached audio. Listen to it and answer using the document below.\n"
+            "If the audio is silent, unclear or not a question, reply briefly asking them to try again.\n"
+            "Reply in plain text, short and direct, in the language the user spoke. "
+            "If the user speaks Hindi, Urdu or Hinglish, reply in Roman script (Hinglish / Roman Urdu), never in Devanagari or Arabic script.\n\n"
+            f"DOCUMENT:\n{document_text}\n\n"
+            f"CONVERSATION SO FAR:\n{history_text}"
+        )
+
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[prompt, types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")],
+        )
+        return {"success": True, "answer": response.text.strip()}
+    except Exception as e:
+        return {"success": False, "error": str(e)}

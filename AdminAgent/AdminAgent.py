@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from file_readers import extract_text_from_file
 from ai_reasoning import analyze_text
 from ai_preparation import generate_reply_draft, save_draft_as_pdf, generate_financial_declaration, generate_application_form
-from ai_chat import answer_question, answer_question_multi
+from ai_chat import answer_question, answer_question_multi, answer_voice_question
 from matching import match_documents, match_documents_rag, guess_category, get_latest_per_category
 from rag_store import add_document as rag_add_document, remove_document as rag_remove_document
 from datetime import datetime
@@ -67,6 +67,7 @@ class State(rx.State):
     results: list[FileResult] = []
     multi_chat_history: list[dict] = []
     multi_chat_input: str = ""
+    recording_index: int = -1
     is_processing: bool = False
     library: list[LibraryItem] = []
     dashboard_rows: list[DashboardRow] = []
@@ -466,6 +467,54 @@ class State(rx.State):
         self.results[index].chat_history.append({"question": question, "answer": answer})
         self.results = self.results
 
+    def start_recording_ui(self, index: int):
+        self.recording_index = index
+
+    def cancel_recording_ui(self):
+        self.recording_index = -1
+
+    def handle_voice_note(self, b64_audio: str):
+        import base64
+        import uuid
+
+        index = self.recording_index
+        self.recording_index = -1
+        if index < 0 or not b64_audio:
+            return
+
+        wav_bytes = base64.b64decode(b64_audio)
+        filename = f"voice_{uuid.uuid4().hex[:10]}.wav"
+        outfile = rx.get_upload_dir() / filename
+        with outfile.open("wb") as f:
+            f.write(wav_bytes)
+        from reflex.config import get_config
+        audio_url = f"{get_config().api_url}/_upload/{filename}"
+        print("[VOICE] audio_url:", audio_url)
+        secs = max(1, round((len(wav_bytes) - 44) / 32000))
+
+        item = self.results[index]
+        history_before = list(item.chat_history)
+        self.results[index].chat_history.append(
+            {"question": "", "answer": "Listening to your voice note...", "audio_url": audio_url, "secs": secs}
+        )
+        self.results = self.results
+        yield
+
+        result = answer_voice_question(item.original_text, wav_bytes, history_before)
+
+        if result["success"]:
+            answer = result["answer"]
+        else:
+            error_text = result["error"]
+            print("[VOICE ERROR]", error_text)
+            if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text:
+                answer = "I've hit my usage limit for now. Please wait a minute and try again."
+            else:
+                answer = "Sorry, I couldn't understand that voice note. Please try again."
+
+        self.results[index].chat_history[-1]["answer"] = answer
+        self.results = self.results
+
     def update_multi_chat_input(self, value: str):
         self.multi_chat_input = value
 
@@ -615,48 +664,132 @@ def draft_section(item: FileResult, index: int) -> rx.Component:
     )
 
 
+VOICE_START_JS = """
+(async function () {
+  try {
+    if (window.__voice) {
+      clearInterval(window.__voice.timer);
+      window.__voice.stream.getTracks().forEach(function (t) { t.stop(); });
+      window.__voice = null;
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const rec = new MediaRecorder(stream);
+    const v = { stream: stream, rec: rec, chunks: [], start: Date.now(), timer: null };
+    window.__voice = v;
+    rec.ondataavailable = function (e) {
+      if (e.data && e.data.size > 0) { v.chunks.push(e.data); }
+    };
+    rec.start();
+    v.timer = setInterval(function () {
+      const secs = Math.floor((Date.now() - v.start) / 1000);
+      const el = document.getElementById('rec-timer');
+      if (el) {
+        el.textContent = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
+      }
+      if (secs >= 20 && rec.state === 'recording') { rec.stop(); }
+    }, 250);
+  } catch (err) {
+    alert('Microphone access was blocked or is not available.');
+  }
+})()
+"""
+
+VOICE_CANCEL_JS = """
+(function () {
+  const v = window.__voice;
+  if (!v) { return; }
+  clearInterval(v.timer);
+  try {
+    v.rec.onstop = null;
+    if (v.rec.state === 'recording') { v.rec.stop(); }
+  } catch (e) {}
+  v.stream.getTracks().forEach(function (t) { t.stop(); });
+  window.__voice = null;
+})()
+"""
+
+VOICE_SEND_JS = """
+new Promise(function (resolve) {
+  const v = window.__voice;
+  if (!v) { resolve(''); return; }
+  clearInterval(v.timer);
+
+  function finish() {
+    v.stream.getTracks().forEach(function (t) { t.stop(); });
+    window.__voice = null;
+    const blob = new Blob(v.chunks, { type: v.rec.mimeType || 'audio/webm' });
+    blob.arrayBuffer().then(function (buf) {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      return ctx.decodeAudioData(buf).then(function (decoded) {
+        ctx.close();
+        const rate = 16000;
+        const length = Math.max(1, Math.ceil(decoded.duration * rate));
+        const off = new OfflineAudioContext(1, length, rate);
+        const src = off.createBufferSource();
+        src.buffer = decoded;
+        src.connect(off.destination);
+        src.start(0);
+        return off.startRendering();
+      });
+    }).then(function (rendered) {
+      const samples = rendered.getChannelData(0);
+      const buffer = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(buffer);
+      function str(o, s) { for (let i = 0; i < s.length; i++) { view.setUint8(o + i, s.charCodeAt(i)); } }
+      str(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true); str(8, 'WAVE');
+      str(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+      view.setUint32(24, 16000, true); view.setUint32(28, 32000, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+      str(36, 'data'); view.setUint32(40, samples.length * 2, true);
+      let pos = 44;
+      for (let i = 0; i < samples.length; i++, pos += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(pos, s < 0 ? s * 32768 : s * 32767, true);
+      }
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 32768) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+      }
+      resolve(btoa(binary));
+    }).catch(function () { resolve(''); });
+  }
+
+  if (v.rec.state === 'recording') {
+    v.rec.onstop = finish;
+    v.rec.stop();
+  } else {
+    finish();
+  }
+})
+"""
+
+
 def chat_bubble(turn: dict) -> rx.Component:
     return rx.vstack(
         rx.box(
-            rx.text(turn["question"]),
+            rx.cond(
+                turn["audio_url"],
+                rx.el.audio(src=turn["audio_url"], controls=True),
+                rx.text(turn["question"]),
+            ),
             padding="0.75em",
             border_radius="8px",
             background="#DCF0FF",
             align_self="flex-end",
             max_width="85%",
         ),
-        rx.hstack(
-            rx.box(
-                rx.text(turn["answer"]),
-                padding="0.75em",
-                border_radius="8px",
-                background="#F0F0F0",
-                max_width="85%",
-            ),
-            rx.button(
-                "🔊",
-                on_click=rx.call_script(
-                    f"""
-                    (function() {{
-                        const text = {turn["answer"]};
-                        window.speechSynthesis.cancel();
-                        const utter = new SpeechSynthesisUtterance(text);
-                        utter.lang = 'en-US';
-                        window.speechSynthesis.speak(utter);
-                    }})()
-                    """
-                ),
-                size="1",
-                variant="ghost",
-            ),
+        rx.box(
+            rx.text(turn["answer"]),
+            padding="0.75em",
+            border_radius="8px",
+            background="#F0F0F0",
             align_self="flex-start",
-            spacing="1",
+            max_width="85%",
         ),
         width="100%",
         spacing="2",
         margin_bottom="0.75em",
     )
-
 
 def chat_section(item: FileResult, index: int) -> rx.Component:
     return rx.vstack(
@@ -698,29 +831,28 @@ def chat_section(item: FileResult, index: int) -> rx.Component:
                 placeholder="e.g. What is the deadline?",
                 width="100%",
             ),
-            rx.button(
-                "🎤",
-                on_click=rx.call_script(
-                    f"""
-                    (function() {{
-                        const input = document.getElementById('chat-input-{index}');
-                        if (!input) return;
-                        const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
-                        if (!Rec) {{
-                            alert('Voice input not supported in this browser.');
-                            return;
-                        }}
-                        const rec = new Rec();
-                        rec.lang = 'en-US';
-                        rec.onresult = function(e) {{
-                            const text = e.results[0][0].transcript;
-                            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                            nativeSetter.call(input, text);
-                            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        }};
-                        rec.start();
-                    }})()
-                    """
+            rx.cond(
+                State.recording_index == index,
+                rx.hstack(
+                    rx.box(width="10px", height="10px", border_radius="50%", background="red"),
+                    rx.text("0:00", id="rec-timer", width="3em"),
+                    rx.button(
+                        rx.icon("x"),
+                        on_click=[State.cancel_recording_ui, rx.call_script(VOICE_CANCEL_JS)],
+                        color_scheme="gray",
+                        variant="soft",
+                    ),
+                    rx.button(
+                    rx.icon("check"),
+                        on_click=rx.call_script(VOICE_SEND_JS, callback=State.handle_voice_note),
+                        color_scheme="green",
+                    ),
+                    align="center",
+                    spacing="2",
+                ),
+                rx.button(
+                    rx.icon("mic"),
+                    on_click=[State.start_recording_ui(index), rx.call_script(VOICE_START_JS)],
                 ),
             ),
             rx.button("Send", on_click=lambda: State.ask_question(index)),
