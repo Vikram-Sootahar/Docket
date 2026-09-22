@@ -6,6 +6,9 @@ from file_readers import extract_text_from_file
 from ai_reasoning import analyze_text
 from ai_preparation import generate_reply_draft, save_draft_as_pdf, generate_financial_declaration, generate_application_form
 from ai_chat import answer_question, answer_question_multi, answer_voice_question
+from cv_builder import QUESTIONS as CV_QUESTIONS, build_cv_pdf, cv_to_text
+from cv_ai import structure_cv
+from reflex.config import get_config
 from matching import match_documents, match_documents_rag, guess_category, get_latest_per_category
 from rag_store import add_document as rag_add_document, remove_document as rag_remove_document
 from datetime import datetime
@@ -68,6 +71,14 @@ class State(rx.State):
     multi_chat_history: list[dict] = []
     multi_chat_input: str = ""
     recording_index: int = -1
+    cv_step: int = -1
+    cv_answers: dict[str, str] = {}
+    cv_input: str = ""
+    cv_message: str = ""
+    cv_notice: str = ""
+    cv_pdf_name: str = ""
+    cv_pdf_url: str = ""
+    cv_data: dict = {}
     is_processing: bool = False
     library: list[LibraryItem] = []
     dashboard_rows: list[DashboardRow] = []
@@ -514,6 +525,110 @@ class State(rx.State):
 
         self.results[index].chat_history[-1]["answer"] = answer
         self.results = self.results
+
+    @rx.var
+    def cv_question_text(self) -> str:
+        if 0 <= self.cv_step < len(CV_QUESTIONS):
+            return CV_QUESTIONS[self.cv_step]["prompt"]
+        return ""
+
+    @rx.var
+    def cv_progress_text(self) -> str:
+        return f"Question {self.cv_step + 1} of {len(CV_QUESTIONS)}"
+
+    def start_cv_builder(self):
+        self.cv_answers = {}
+        self.cv_input = ""
+        self.cv_message = ""
+        self.cv_notice = ""
+        self.cv_pdf_name = ""
+        self.cv_pdf_url = ""
+        self.cv_data = {}
+        self.cv_step = 0
+
+    def close_cv_builder(self):
+        self.cv_step = -1
+        self.cv_message = ""
+
+    def update_cv_input(self, value: str):
+        self.cv_input = value
+
+    def submit_cv_answer(self, skip: bool):
+        if self.cv_step < 0 or self.cv_step >= len(CV_QUESTIONS):
+            return
+        key = CV_QUESTIONS[self.cv_step]["key"]
+        answer = "skip" if skip else self.cv_input.strip()
+        if not answer:
+            self.cv_message = "Please type an answer, or press Skip."
+            return
+        self.cv_answers[key] = answer
+        self.cv_input = ""
+        self.cv_message = ""
+        self.cv_step += 1
+        if self.cv_step >= len(CV_QUESTIONS):
+            self.cv_message = "Writing your CV..."
+            return State.generate_cv
+
+    def generate_cv(self):
+        self.cv_message = "Writing your CV..."
+        yield
+
+        result = structure_cv(dict(self.cv_answers))
+        if not result["success"]:
+            error_text = result["error"]
+            print("[CV ERROR]", error_text)
+            if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text:
+                self.cv_message = "I've hit my usage limit for now. Please wait a minute and press Try again."
+            else:
+                self.cv_message = "Sorry, I couldn't write the CV right now. Please press Try again."
+            return
+
+        cv = result["cv"]
+        filename = f"CV_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        outfile = rx.get_upload_dir() / filename
+        pdf = build_cv_pdf(cv, str(outfile))
+        if not pdf["success"]:
+            print("[CV PDF ERROR]", pdf["error"])
+            self.cv_message = "Sorry, I couldn't create the PDF. Please press Try again."
+            return
+
+        self.cv_data = cv
+        self.cv_pdf_name = filename
+        self.cv_pdf_url = f"{get_config().api_url}/_upload/{filename}"
+        self.cv_message = ""
+
+    def approve_cv(self):
+        if not self.cv_pdf_name:
+            return
+        filename = self.cv_pdf_name
+        uploaded_at = datetime.now().isoformat()
+        rag_add_document(filename, cv_to_text(self.cv_data), doc_type="CV/Resume", uploaded_at=uploaded_at)
+
+        combined = self.library + [
+            LibraryItem(filename=filename, category="CV/Resume", uploaded_at=uploaded_at)
+        ]
+        combined_as_dicts = [
+            {"filename": i.filename, "category": i.category, "uploaded_at": i.uploaded_at}
+            for i in combined
+        ]
+        with_latest = get_latest_per_category(combined_as_dicts)
+        self.library = [
+            LibraryItem(
+                filename=d["filename"],
+                category=d["category"],
+                uploaded_at=d["uploaded_at"],
+                is_latest=d["is_latest"],
+            )
+            for d in with_latest
+        ]
+
+        for i, r in enumerate(self.results):
+            if r.required_documents and r.document_matches:
+                self.check_required_documents(i)
+
+        self.cv_step = -1
+        self.cv_message = ""
+        self.cv_notice = f"{filename} was added to your library."
 
     def update_multi_chat_input(self, value: str):
         self.multi_chat_input = value
@@ -967,6 +1082,97 @@ def library_item_row(lib_item: LibraryItem) -> rx.Component:
         padding="0.5em",
     )
 
+def cv_builder_section() -> rx.Component:
+    question_panel = rx.vstack(
+        rx.text(State.cv_progress_text, size="2", color="gray"),
+        rx.text(State.cv_question_text, weight="bold"),
+        rx.text_area(
+            value=State.cv_input,
+            on_change=State.update_cv_input,
+            placeholder="Type your answer here...",
+            width="100%",
+            rows="4",
+        ),
+        rx.cond(State.cv_message != "", rx.text(State.cv_message, color="red", size="2")),
+        rx.hstack(
+            rx.button("Next", on_click=State.submit_cv_answer(False)),
+            rx.cond(
+                State.cv_step >= 2,
+                rx.button("Skip", on_click=State.submit_cv_answer(True), variant="soft", color_scheme="gray"),
+            ),
+            rx.button("Cancel", on_click=State.close_cv_builder, variant="ghost", color_scheme="red"),
+            spacing="2",
+        ),
+        spacing="2",
+        width="100%",
+        align="start",
+    )
+
+    preview_panel = rx.vstack(
+        rx.text("Your CV is ready. Please review it, then approve.", weight="bold"),
+        rx.el.iframe(src=State.cv_pdf_url, width="100%", height="520px"),
+        rx.hstack(
+            rx.button("Approve & Save to Library", on_click=State.approve_cv, color_scheme="green"),
+            rx.link("Open in new tab", href=State.cv_pdf_url, is_external=True),
+            rx.button("Start over", on_click=State.start_cv_builder, variant="soft", color_scheme="gray"),
+            rx.button("Discard", on_click=State.close_cv_builder, variant="ghost", color_scheme="red"),
+            spacing="3",
+            align="center",
+        ),
+        spacing="2",
+        width="100%",
+        align="start",
+    )
+
+    working_panel = rx.vstack(
+        rx.text(State.cv_message),
+        rx.cond(
+            State.cv_message == "Writing your CV...",
+            rx.spinner(),
+            rx.hstack(
+                rx.button("Try again", on_click=State.generate_cv),
+                rx.button("Cancel", on_click=State.close_cv_builder, variant="ghost", color_scheme="red"),
+                spacing="2",
+            ),
+        ),
+        spacing="2",
+        width="100%",
+        align="start",
+    )
+
+    return rx.vstack(
+        rx.cond(
+            State.cv_step < 0,
+            rx.vstack(
+                rx.button(
+                    "Create my CV with AI",
+                    on_click=State.start_cv_builder,
+                    color_scheme="green",
+                    variant="soft",
+                ),
+                rx.cond(
+                    State.cv_notice != "",
+                    rx.callout(State.cv_notice, icon="check", color_scheme="green"),
+                ),
+                align="start",
+                spacing="2",
+                width="100%",
+            ),
+            rx.box(
+                rx.cond(
+                    State.cv_step < len(CV_QUESTIONS),
+                    question_panel,
+                    rx.cond(State.cv_pdf_url != "", preview_panel, working_panel),
+                ),
+                padding="1em",
+                border="1px solid #E5E7EB",
+                border_radius="8px",
+                width="100%",
+            ),
+        ),
+        width="100%",
+        align="start",
+    )
 
 def library_section() -> rx.Component:
     return rx.vstack(
@@ -1228,6 +1434,7 @@ def index() -> rx.Component:
             ),
 
             library_section(),
+            cv_builder_section(),
             dashboard_section(),
             command_bar_section(),
 

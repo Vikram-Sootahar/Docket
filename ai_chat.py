@@ -9,6 +9,7 @@ and remembers the conversation so far for follow-up questions.
 import os
 from dotenv import load_dotenv
 from google import genai
+from gemini_retry import generate_with_retry
 
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -49,7 +50,7 @@ Respond with a clear, concise answer (2-4 sentences). No markdown formatting.
 """
 
     try:
-        response = client.models.generate_content(
+        response = generate_with_retry(
             model="gemini-3.6-flash",
             contents=prompt
         )
@@ -102,7 +103,7 @@ Respond with a clear, concise answer (2-5 sentences). Mention which document(s) 
 """
 
     try:
-        response = client.models.generate_content(
+        response = generate_with_retry(
             model="gemini-3.6-flash",
             contents=prompt
         )
@@ -130,13 +131,13 @@ def answer_voice_question(document_text: str, audio_bytes: bytes, history: list[
             "You are AdminAgent, a helpful assistant that answers questions about a document.\n"
             "The user's question is spoken in the attached audio. Listen to it and answer using the document below.\n"
             "If the audio is silent, unclear or not a question, reply briefly asking them to try again.\n"
-            "Reply in plain text, short and direct, in the language the user spoke. "
+            "Reply in plain text, short and direct, always in English, even if the user spoke another language.\n\n"
             "If the user speaks Hindi, Urdu or Hinglish, reply in Roman script (Hinglish / Roman Urdu), never in Devanagari or Arabic script.\n\n"
             f"DOCUMENT:\n{document_text}\n\n"
             f"CONVERSATION SO FAR:\n{history_text}"
         )
 
-        response = client.models.generate_content(
+        response = generate_with_retry(
             model="gemini-3.6-flash",
             contents=[prompt, types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")],
         )

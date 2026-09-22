@@ -1,10 +1,8 @@
 """Natural-language command routing - understands user commands and maps them to actions."""
+from gemini_retry import generate_with_retry
 
 import os
 import json
-import google.generativeai as genai
-
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 
 VALID_ACTIONS = ["generate_draft", "check_documents", "approve", "reject", "summarize"]
 
@@ -41,8 +39,7 @@ Respond ONLY with valid JSON, no extra text, no markdown, in this exact format:
 """
 
     try:
-        model = genai.GenerativeModel("gemini-3.6-flash")
-        response = model.generate_content(prompt)
+        response = generate_with_retry(contents=prompt)
         raw_text = response.text.strip()
 
         if raw_text.startswith("```"):

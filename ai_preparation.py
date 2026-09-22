@@ -7,6 +7,7 @@ Takes the analysis from ai_reasoning.py and generates a usable draft
 
 import os
 import json
+from gemini_retry import generate_with_retry
 from dotenv import load_dotenv
 from google import genai
 from reportlab.lib.pagesizes import letter
@@ -41,8 +42,7 @@ Respond with ONLY the draft reply text, nothing else — no subject line, no exp
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3.6-flash",
+        response = generate_with_retry(
             contents=prompt
     )
         draft = response.text.strip()
@@ -88,7 +88,7 @@ Respond with ONLY the cover letter text, nothing else — no subject line, no ex
 """
 
     try:
-        response = client.models.generate_content(
+        response = generate_with_retry(
             model="gemini-3.6-flash",
             contents=prompt
         )
@@ -185,7 +185,7 @@ Respond with ONLY the JSON object, nothing else — no markdown formatting, no e
 """
 
     try:
-        response = client.models.generate_content(
+        response = generate_with_retry(
             model="gemini-3.6-flash",
             contents=prompt
         )

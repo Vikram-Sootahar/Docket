@@ -14,13 +14,11 @@ import os
 import json
 from datetime import date
 from dotenv import load_dotenv
-import google.generativeai as genai
+from gemini_retry import generate_with_retry
 
 # Load the API key from .env
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-model = genai.GenerativeModel("gemini-3.6-flash")
 
 
 def analyze_text(text: str) -> dict:
@@ -51,7 +49,7 @@ TEXT TO ANALYZE:
 """
 
     try:
-        response = model.generate_content(prompt)
+        response = generate_with_retry(contents=prompt)
         raw_output = response.text.strip()
 
         if raw_output.startswith("```"):
