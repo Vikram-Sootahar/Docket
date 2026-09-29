@@ -1,8 +1,8 @@
 """Natural-language command routing - understands user commands and maps them to actions."""
-from gemini_retry import generate_with_retry
-
 import os
 import json
+import re
+from gemini_retry import generate_with_retry
 
 VALID_ACTIONS = ["generate_draft", "check_documents", "approve", "reject", "summarize"]
 
@@ -16,8 +16,12 @@ def route_command(command_text: str, documents: list[dict]) -> dict:
         return {"success": False, "filename": "", "action": "", "error": "No documents available."}
 
     doc_list_text = "\n".join(
-        f"- {d['filename']} (type: {d['task_type']})" for d in documents
+        f"- {d.get('filename', '')} (type: {d.get('task_type', 'other')})"
+        for d in documents if isinstance(d, dict) and d.get("filename")
     )
+
+    if not doc_list_text.strip():
+        return {"success": False, "filename": "", "action": "", "error": "No valid documents to route."}
 
     prompt = f"""You are a command router for a document management app.
 Available documents:
@@ -38,22 +42,22 @@ Respond ONLY with valid JSON, no extra text, no markdown, in this exact format:
 {{"filename": "<exact filename from the list>", "action": "<one of the actions>"}}
 """
 
+    raw_text = ""
     try:
         response = generate_with_retry(contents=prompt)
-        raw_text = response.text.strip()
+        raw_text = (response.text if response and hasattr(response, "text") else "").strip()
 
-        if raw_text.startswith("```"):
-            raw_text = raw_text.strip("`")
-            if raw_text.startswith("json"):
-                raw_text = raw_text[4:]
-            raw_text = raw_text.strip()
+        # Extract JSON block robustly
+        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if json_match:
+            raw_text = json_match.group(0)
 
         parsed = json.loads(raw_text)
 
-        filename = parsed.get("filename", "")
-        action = parsed.get("action", "")
+        filename = str(parsed.get("filename", "") or "").strip()
+        action = str(parsed.get("action", "") or "").strip()
 
-        valid_filenames = [d["filename"] for d in documents]
+        valid_filenames = [d.get("filename", "") for d in documents if isinstance(d, dict)]
         if filename not in valid_filenames:
             return {"success": False, "filename": "", "action": "", "error": "Could not match command to a known document."}
 

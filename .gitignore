@@ -29,3 +29,18 @@ test_files/
 *_draft.pdf
 *_output.pdf
 reflex.lock/
+
+# WSL virtual environment
+wsl_venv/
+
+# Library index (personal data)
+library_index.json
+
+# RAG backup
+rag_db_backup/
+
+# Editor and debug files
+.vscode/
+full_requirements.txt
+reflex_debug.log
+reflex_log.txt

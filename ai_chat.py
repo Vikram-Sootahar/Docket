@@ -33,7 +33,11 @@ def answer_question(document_text: str, question: str, history: list[dict] = Non
 
     conversation_so_far = ""
     for turn in history:
-        conversation_so_far += f"Q: {turn['question']}\nA: {turn['answer']}\n\n"
+        if isinstance(turn, dict):
+            q = turn.get("question", "")
+            a = turn.get("answer", "")
+            if q or a:
+                conversation_so_far += f"Q: {q}\nA: {a}\n\n"
 
     prompt = f"""You are an assistant answering questions about a specific document. Only use information from the document below to answer. If the answer is not in the document, say so clearly — do not invent information.
 
@@ -54,7 +58,7 @@ Respond with a clear, concise answer (2-4 sentences). No markdown formatting.
             model="gemini-3.6-flash",
             contents=prompt
         )
-        answer = response.text.strip()
+        answer = response.text.strip() if response and hasattr(response, "text") else ""
 
         if not answer:
             return {"success": False, "error": "AI returned an empty answer."}
@@ -82,11 +86,18 @@ def answer_question_multi(documents: list[dict], question: str, history: list[di
 
     conversation_so_far = ""
     for turn in history:
-        conversation_so_far += f"Q: {turn['question']}\nA: {turn['answer']}\n\n"
+        if isinstance(turn, dict):
+            q = turn.get("question", "")
+            a = turn.get("answer", "")
+            if q or a:
+                conversation_so_far += f"Q: {q}\nA: {a}\n\n"
 
     documents_text = ""
     for doc in documents:
-        documents_text += f"--- Document: {doc['filename']} ---\n{doc['text'][:4000]}\n\n"
+        if isinstance(doc, dict):
+            fname = doc.get("filename", "unknown")
+            text = doc.get("text", "")
+            documents_text += f"--- Document: {fname} ---\n{text[:4000]}\n\n"
 
     prompt = f"""You are an assistant answering questions using MULTIPLE documents as context. Compare, combine, or reference specific documents by name as needed to answer accurately. If the answer is not found in any document, say so clearly — do not invent information.
 
@@ -107,7 +118,7 @@ Respond with a clear, concise answer (2-5 sentences). Mention which document(s) 
             model="gemini-3.6-flash",
             contents=prompt
         )
-        answer = response.text.strip()
+        answer = response.text.strip() if response and hasattr(response, "text") else ""
 
         if not answer:
             return {"success": False, "error": "AI returned an empty answer."}
@@ -119,13 +130,16 @@ Respond with a clear, concise answer (2-5 sentences). Mention which document(s) 
 
 def answer_voice_question(document_text: str, audio_bytes: bytes, history: list[dict] = None) -> dict:
     """Answer a question spoken in a WAV voice note. Replies in text."""
+    if not audio_bytes:
+        return {"success": False, "error": "No voice audio provided."}
     try:
         from google.genai import types
 
         history_text = ""
         for turn in (history or [])[-6:]:
-            q = turn.get("question") or "(voice note)"
-            history_text += f"User: {q}\nAssistant: {turn.get('answer', '')}\n"
+            if isinstance(turn, dict):
+                q = turn.get("question") or "(voice note)"
+                history_text += f"User: {q}\nAssistant: {turn.get('answer', '')}\n"
 
         prompt = (
             "You are AdminAgent, a helpful assistant that answers questions about a document.\n"
@@ -141,6 +155,9 @@ def answer_voice_question(document_text: str, audio_bytes: bytes, history: list[
             model="gemini-3.6-flash",
             contents=[prompt, types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")],
         )
-        return {"success": True, "answer": response.text.strip()}
+        answer = response.text.strip() if response and hasattr(response, "text") else ""
+        if not answer:
+            return {"success": False, "error": "AI returned empty voice response."}
+        return {"success": True, "answer": answer}
     except Exception as e:
         return {"success": False, "error": str(e)}

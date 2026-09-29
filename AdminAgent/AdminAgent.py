@@ -1,5 +1,8 @@
-"""AdminAgent - File Upload & Text Extraction with AI Reasoning."""
+"""Docket - File Upload & Text Extraction with AI Reasoning."""
 
+import asyncio
+import json
+from pathlib import Path
 import reflex as rx
 from pydantic import BaseModel
 from file_readers import extract_text_from_file
@@ -7,6 +10,7 @@ from ai_reasoning import analyze_text
 from ai_preparation import generate_reply_draft, save_draft_as_pdf, generate_financial_declaration, generate_application_form
 from ai_chat import answer_question, answer_question_multi, answer_voice_question
 from cv_builder import QUESTIONS as CV_QUESTIONS, build_cv_pdf, cv_to_text
+from assistant import assistant_reply
 from cv_ai import structure_cv
 from reflex.config import get_config
 from matching import match_documents, match_documents_rag, guess_category, get_latest_per_category
@@ -16,6 +20,18 @@ from dashboard import build_dashboard_rows
 from audit import create_log_entry
 from command_router import route_command
 from cv_parser import parse_cv_fields
+
+LIBRARY_INDEX = Path("library_index.json")
+
+CREAM = "#FAF6EC"
+CREAM_DARK = "#F0E6CE"
+INK = "#1A1A1A"
+MUTED = "#6B6B63"
+BORDER = "#E4DCC8"
+ACCENT = "#D9CBA0"
+DANGER = "#B03A2E"
+DARK_BTN = "#1A1A1A"
+FONT_SERIF = "Georgia, 'Times New Roman', serif"
 
 
 class LibraryItem(BaseModel):
@@ -79,12 +95,25 @@ class State(rx.State):
     cv_pdf_name: str = ""
     cv_pdf_url: str = ""
     cv_data: dict = {}
+    assistant_history: list[dict] = []
+    assistant_input: str = ""
+    assistant_typing: bool = False
+    assistant_recording: bool = False
     is_processing: bool = False
     library: list[LibraryItem] = []
     dashboard_rows: list[DashboardRow] = []
     audit_log: list[AuditLogEntry] = []
     command_input: str = ""
     command_result_message: str = ""
+
+    def reset_draft(self, index: int):
+        self.results[index].draft_generated = False
+        self.results[index].draft_text = ""
+        self.results = self.results
+
+    def send_assistant_with_text(self, text: str):
+        self.assistant_input = text or ""
+        return State.send_assistant_message
 
     def refresh_dashboard(self):
         tasks = [
@@ -158,78 +187,130 @@ class State(rx.State):
             return
 
         self.is_processing = True
-        self.results = []
+
+        upload_dir = rx.get_upload_dir()
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
         new_results = []
         for file in files:
-            upload_data = await file.read()
+            try:
+                upload_data = await file.read()
 
-            outfile = rx.get_upload_dir() / file.name
-            with outfile.open("wb") as f:
-                f.write(upload_data)
+                outfile = upload_dir / file.name
+                with outfile.open("wb") as f:
+                    f.write(upload_data)
 
-            extraction = extract_text_from_file(str(outfile))
+                extraction = await asyncio.to_thread(extract_text_from_file, str(outfile))
 
-            if not extraction["success"]:
+                if not extraction.get("success"):
+                    new_results.append(FileResult(
+                        filename=file.name,
+                        extraction_success=False,
+                        error=extraction.get("error", "Unknown extraction error"),
+                        analysis_success=False,
+                    ))
+                    continue
+
+                analysis = await asyncio.to_thread(analyze_text, extraction["text"])
+
+                if analysis.get("success"):
+                    new_results.append(FileResult(
+                        filename=file.name,
+                        extraction_success=True,
+                        analysis_success=True,
+                        original_text=extraction["text"],
+                        task_type=analysis.get("task_type", ""),
+                        summary=analysis.get("summary", ""),
+                        deadline=analysis.get("deadline", ""),
+                        required_documents=analysis.get("required_documents", []),
+                        amount=analysis.get("amount", ""),
+                        recipient_or_purpose=analysis.get("recipient_or_purpose", ""),
+                        key_details=analysis.get("key_details", ""),
+                    ))
+                else:
+                    new_results.append(FileResult(
+                        filename=file.name,
+                        extraction_success=True,
+                        error=analysis.get("error", "Unknown analysis error"),
+                        analysis_success=False,
+                    ))
+            except Exception as e:
+                print(f"[Upload Error] {file.name}: {e}")
                 new_results.append(FileResult(
                     filename=file.name,
                     extraction_success=False,
-                    error=extraction["error"],
-                    analysis_success=False,
-                ))
-                continue
-
-            analysis = analyze_text(extraction["text"])
-
-            if analysis["success"]:
-                new_results.append(FileResult(
-                    filename=file.name,
-                    extraction_success=True,
-                    analysis_success=True,
-                    original_text=extraction["text"],
-                    task_type=analysis["task_type"],
-                    summary=analysis["summary"],
-                    deadline=analysis["deadline"],
-                    required_documents=analysis["required_documents"],
-                    amount=analysis["amount"],
-                    recipient_or_purpose=analysis["recipient_or_purpose"],
-                    key_details=analysis["key_details"],
-                ))
-            else:
-                new_results.append(FileResult(
-                    filename=file.name,
-                    extraction_success=True,
-                    error=analysis["error"],
+                    error=str(e),
                     analysis_success=False,
                 ))
 
-        self.results = new_results
+        self.results = self.results + new_results
         self.is_processing = False
         self.refresh_dashboard()
+
+    def _save_library_index(self):
+        data = [
+            {"filename": i.filename, "category": i.category, "uploaded_at": i.uploaded_at}
+            for i in self.library
+        ]
+        try:
+            LIBRARY_INDEX.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"[Library Save Error] {e}")
+
+    def load_library(self):
+        if not LIBRARY_INDEX.exists():
+            return
+        try:
+            data = json.loads(LIBRARY_INDEX.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[Library Load Error] {e}")
+            return
+        with_latest = get_latest_per_category(data)
+        self.library = [
+            LibraryItem(
+                filename=d["filename"],
+                category=d["category"],
+                uploaded_at=d["uploaded_at"],
+                is_latest=d["is_latest"],
+            )
+            for d in with_latest
+        ]
 
     async def handle_library_upload(self, files: list[rx.UploadFile]):
         if not files:
             return
 
+        upload_dir = rx.get_upload_dir()
+        upload_dir.mkdir(parents=True, exist_ok=True)
+
         new_items = []
         for file in files:
-            upload_data = await file.read()
-            outfile = rx.get_upload_dir() / file.name
-            with outfile.open("wb") as f:
-                f.write(upload_data)
+            try:
+                upload_data = await file.read()
+                outfile = upload_dir / file.name
+                with outfile.open("wb") as f:
+                    f.write(upload_data)
 
-            extraction = extract_text_from_file(str(outfile))
-            lib_text = extraction.get("text", "") if extraction.get("success") else ""
-            category = guess_category(file.name)
-            uploaded_at = datetime.now().isoformat()
-            rag_add_document(file.name, lib_text, doc_type=category, uploaded_at=uploaded_at)
-            print(f"[RAG] indexed {file.name}: {len(lib_text)} chars, category={category}")
+                extraction = await asyncio.to_thread(extract_text_from_file, str(outfile))
+                lib_text = extraction.get("text", "") if extraction.get("success") else ""
+                category = guess_category(file.name)
+                uploaded_at = datetime.now().isoformat()
 
-            new_items.append(LibraryItem(
-                filename=file.name,
-                category=category,
-                uploaded_at=uploaded_at,
-            ))
+                if lib_text:
+                    await asyncio.to_thread(
+                        rag_add_document, file.name, lib_text, doc_type=category, uploaded_at=uploaded_at
+                    )
+                    print(f"[RAG] indexed {file.name}: {len(lib_text)} chars, category={category}")
+                else:
+                    print(f"[RAG] Warning: No text extracted for {file.name}")
+
+                new_items.append(LibraryItem(
+                    filename=file.name,
+                    category=category,
+                    uploaded_at=uploaded_at,
+                ))
+            except Exception as e:
+                print(f"[Library Upload Error] {file.name}: {e}")
 
         combined = self.library + new_items
 
@@ -248,6 +329,7 @@ class State(rx.State):
             )
             for d in with_latest
         ]
+        self._save_library_index()
 
     def remove_library_item(self, filename: str):
         rag_remove_document(filename)
@@ -268,6 +350,7 @@ class State(rx.State):
             )
             for d in with_latest
         ]
+        self._save_library_index()
 
     def check_required_documents(self, index: int):
         item = self.results[index]
@@ -630,6 +713,112 @@ class State(rx.State):
         self.cv_message = ""
         self.cv_notice = f"{filename} was added to your library."
 
+    def build_assistant_context(self) -> str:
+        lines = [f"TODAY: {datetime.now().strftime('%Y-%m-%d')}", "TASKS:"]
+        if not self.dashboard_rows:
+            lines.append("(no documents uploaded yet)")
+        else:
+            for row in self.dashboard_rows:
+                missing = ", ".join(row.missing) if row.missing else "none"
+                lines.append(
+                    f"- {row.filename} | type: {row.task_type} | deadline: {row.deadline} | "
+                    f"status: {row.completion_text} | missing: {missing}"
+                )
+        lines.append("LIBRARY:")
+        if not self.library:
+            lines.append("(empty)")
+        else:
+            for item in self.library:
+                tag = " (latest)" if item.is_latest else ""
+                lines.append(f"- {item.filename} ({item.category}){tag}")
+        return "\n".join(lines)
+
+    def _run_assistant_action(self, action: str, filename: str):
+        if action == "start_cv_builder":
+            self.start_cv_builder()
+            return
+        if action in ("check_documents", "generate_draft"):
+            for i, r in enumerate(self.results):
+                if r.filename == filename:
+                    if action == "check_documents":
+                        self.check_required_documents(i)
+                    else:
+                        self.generate_draft(i)
+                    return
+
+    def update_assistant_input(self, value: str):
+        self.assistant_input = value
+
+    def send_assistant_message(self):
+        text = self.assistant_input.strip()
+        if not text:
+            return
+
+        self.assistant_history.append({"role": "user", "text": text})
+        self.assistant_input = ""
+        self.assistant_typing = True
+        yield
+
+        context = self.build_assistant_context()
+        filenames = [r.filename for r in self.results]
+        result = assistant_reply(text, context, self.assistant_history[:-1], filenames)
+
+        self.assistant_typing = False
+        if result["success"]:
+            self.assistant_history.append({"role": "assistant", "text": result["reply"]})
+            self._run_assistant_action(result["action"], result["filename"])
+        else:
+            error_text = result["error"]
+            print("[ASSISTANT ERROR]", error_text)
+            if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text:
+                msg = "I've hit my usage limit for now. Please wait a minute and try again."
+            else:
+                msg = "Sorry, something went wrong. Please try again."
+            self.assistant_history.append({"role": "assistant", "text": msg})
+
+    def start_assistant_recording(self):
+        self.assistant_recording = True
+
+    def cancel_assistant_recording(self):
+        self.assistant_recording = False
+
+    def handle_assistant_voice_note(self, b64_audio: str):
+        import base64
+        import uuid
+
+        self.assistant_recording = False
+        if not b64_audio:
+            return
+
+        wav_bytes = base64.b64decode(b64_audio)
+        filename = f"voice_{uuid.uuid4().hex[:10]}.wav"
+        outfile = rx.get_upload_dir() / filename
+        with outfile.open("wb") as f:
+            f.write(wav_bytes)
+        audio_url = f"{get_config().api_url}/_upload/{filename}"
+        secs = max(1, round((len(wav_bytes) - 44) / 32000))
+
+        self.assistant_history.append({"role": "user", "text": "", "audio_url": audio_url, "secs": secs})
+        self.assistant_typing = True
+        yield
+
+        context = self.build_assistant_context()
+        filenames = [r.filename for r in self.results]
+        result = assistant_reply("", context, self.assistant_history[:-1], filenames, audio_bytes=wav_bytes)
+
+        self.assistant_typing = False
+        if result["success"]:
+            self.assistant_history.append({"role": "assistant", "text": result["reply"]})
+            self._run_assistant_action(result["action"], result["filename"])
+        else:
+            error_text = result["error"]
+            print("[ASSISTANT ERROR]", error_text)
+            if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text:
+                msg = "I've hit my usage limit for now. Please wait a minute and try again."
+            else:
+                msg = "Sorry, I couldn't understand that voice note. Please try again."
+            self.assistant_history.append({"role": "assistant", "text": msg})
+
     def update_multi_chat_input(self, value: str):
         self.multi_chat_input = value
 
@@ -739,15 +928,33 @@ def draft_section(item: FileResult, index: int) -> rx.Component:
                         rx.cond(
                             item.draft_status == "rejected",
                             rx.callout("Draft rejected.", icon="x", color_scheme="red"),
-                            rx.hstack(
-                                rx.button("Approve", on_click=lambda: State.approve_draft(index), color_scheme="green"),
-                                rx.button(
-                                    rx.cond(item.is_editing, "Done Editing", "Edit"),
-                                    on_click=lambda: State.toggle_edit(index),
-                                    color_scheme="blue",
+                            rx.cond(
+                                item.draft_text.startswith("No CV found"),
+                                rx.vstack(
+                                    rx.text(
+                                        "Add a CV to your library first, then try again.",
+                                        size="1",
+                                        color="gray",
+                                    ),
+                                    rx.button(
+                                        "Try again",
+                                        on_click=lambda: State.reset_draft(index),
+                                        size="1",
+                                        variant="soft",
+                                    ),
+                                    spacing="2",
+                                    align="start",
                                 ),
-                                rx.button("Reject", on_click=lambda: State.reject_draft(index), color_scheme="red"),
-                                spacing="3",
+                                rx.hstack(
+                                    rx.button("Approve", on_click=lambda: State.approve_draft(index), color_scheme="green"),
+                                    rx.button(
+                                        rx.cond(item.is_editing, "Done Editing", "Edit"),
+                                        on_click=lambda: State.toggle_edit(index),
+                                        color_scheme="blue",
+                                    ),
+                                    rx.button("Reject", on_click=lambda: State.reject_draft(index), color_scheme="red"),
+                                    spacing="3",
+                                ),
                             ),
                         ),
                     ),
@@ -1061,10 +1268,10 @@ def multi_chat_section() -> rx.Component:
         margin_top="1em",
     )
 
-def library_item_row(lib_item: LibraryItem) -> rx.Component:
+def library_item_row(lib_item) -> rx.Component:
     return rx.hstack(
-        rx.badge(lib_item.category, color_scheme="purple"),
-        rx.text(lib_item.filename),
+        rx.badge(lib_item.category, color_scheme="gray", variant="soft"),
+        rx.text(lib_item.filename, color=INK),
         rx.cond(
             lib_item.is_latest,
             rx.badge("Latest", color_scheme="green", size="1"),
@@ -1076,10 +1283,12 @@ def library_item_row(lib_item: LibraryItem) -> rx.Component:
             on_click=lambda: State.remove_library_item(lib_item.filename),
             size="1",
             variant="ghost",
-            color_scheme="red",
+            color=DANGER,
         ),
         width="100%",
-        padding="0.5em",
+        padding="0.6em 0.75em",
+        background=CREAM,
+        border_radius="8px",
     )
 
 def cv_builder_section() -> rx.Component:
@@ -1174,125 +1383,262 @@ def cv_builder_section() -> rx.Component:
         align="start",
     )
 
-def library_section() -> rx.Component:
-    return rx.vstack(
-        rx.heading("My Document Library", size="5"),
-        rx.text(
-            "Upload your CV, transcript, photo, or financial documents once — they'll be reused to check against every task's requirements.",
-            size="2",
-            color="gray",
-        ),
-
-        rx.upload(
-            rx.vstack(
-                rx.button("Add to Library", type="button"),
-                rx.text("or drag and drop files here"),
+def assistant_bubble(turn: dict) -> rx.Component:
+    return rx.cond(
+        turn["role"] == "user",
+        rx.box(
+            rx.cond(
+                turn["audio_url"],
+                rx.el.audio(src=turn["audio_url"], controls=True),
+                rx.text(turn["text"]),
             ),
-            id="library_upload",
-            multiple=True,
-            border="2px dashed #ccc",
-            padding="1.5em",
+            padding="0.6em 0.9em",
             border_radius="10px",
+            background="#DCF0FF",
+            align_self="flex-end",
+            max_width="80%",
         ),
-
-        rx.button(
-            "Save to Library",
-            on_click=State.handle_library_upload(rx.upload_files(upload_id="library_upload")),
+        rx.box(
+            rx.text(turn["text"]),
+            padding="0.6em 0.9em",
+            border_radius="10px",
+            background="#F0F0F0",
+            align_self="flex-start",
+            max_width="80%",
         ),
+    )
 
-        rx.foreach(State.library, library_item_row),
 
+def assistant_section() -> rx.Component:
+    return rx.vstack(
+        rx.heading("Assistant", size="5", font_family=FONT_SERIF, color=INK),
+        rx.text(
+            "Ask about your tasks, or tell it what to do next.",
+            size="2",
+            color=MUTED,
+        ),
+        rx.hstack(
+            rx.button(
+                "check documents for the scholarship",
+                on_click=lambda: State.update_assistant_input("check documents for the scholarship"),
+                size="1",
+                variant="surface",
+                border_radius="16px",
+            ),
+            rx.button(
+                "create my CV",
+                on_click=lambda: State.update_assistant_input("create my CV"),
+                size="1",
+                variant="surface",
+                border_radius="16px",
+            ),
+            rx.button(
+                "what's missing?",
+                on_click=lambda: State.update_assistant_input("what's missing?"),
+                size="1",
+                variant="surface",
+                border_radius="16px",
+            ),
+            spacing="2",
+            wrap="wrap",
+        ),
+        rx.box(
+            rx.vstack(
+                rx.foreach(State.assistant_history, assistant_bubble),
+                rx.cond(
+                    State.assistant_typing,
+                    rx.hstack(
+                        rx.spinner(size="1"),
+                        rx.text("Thinking...", size="2", color=MUTED),
+                        spacing="2",
+                    ),
+                ),
+                spacing="2",
+                width="100%",
+                align="start",
+            ),
+            width="100%",
+            max_height="360px",
+            overflow_y="auto",
+            padding="0.5em",
+        ),
+        rx.hstack(
+            rx.input(
+                id="assistant-input",
+                value=State.assistant_input,
+                on_change=State.update_assistant_input,
+                placeholder="Ask anything",
+                width="100%",
+                background=CREAM,
+                border=f"1px solid {BORDER}",
+                on_key_down=lambda k: rx.cond(
+                    k == "Enter", 
+                    rx.call_script(
+                        "document.getElementById('assistant-input').value",
+                        callback=State.send_assistant_with_text,
+                    ),
+                    rx.console_log(""),
+                ),
+            ),
+            rx.cond(
+                State.assistant_recording,
+                rx.hstack(
+                    rx.box(width="10px", height="10px", border_radius="50%", background="red"),
+                    rx.text("0:00", id="assistant-rec-timer", width="3em"),
+                    rx.button(
+                        rx.icon("x"),
+                        on_click=[State.cancel_assistant_recording, rx.call_script(VOICE_CANCEL_JS)],
+                        color_scheme="gray",
+                        variant="soft",
+                    ),
+                    rx.button(
+                        rx.icon("check"),
+                        on_click=rx.call_script(VOICE_SEND_JS, callback=State.handle_assistant_voice_note),
+                        color_scheme="green",
+                    ),
+                    align="center",
+                    spacing="2",
+                ),
+                rx.button(
+                    rx.icon("mic"),
+                    on_click=[State.start_assistant_recording, rx.call_script(VOICE_START_JS)],
+                    variant="surface",
+                ),
+            ),
+            rx.button(
+                "Send",
+                on_click=State.send_assistant_message,
+                background=DARK_BTN,
+                color="white",
+                border_radius="6px",
+            ),
+            width="100%",
+            spacing="2",
+        ),
         width="100%",
         align="start",
         spacing="3",
         padding="1.5em",
-        border="1px solid #ddd",
-        border_radius="10px",
+        background="white",
+        border=f"1px solid {BORDER}",
+        border_radius="12px",
+    )
+
+
+def library_section() -> rx.Component:
+    return rx.vstack(
+        rx.heading("Your document library", size="5", font_family=FONT_SERIF, color=INK),
+        rx.text(
+            "Upload your CV, transcript, photo, or financial documents once — "
+            "they'll be reused to check against every task's requirements.",
+            size="2",
+            color=MUTED,
+        ),
+ 
+        rx.upload(
+            rx.vstack(
+                rx.text("+ Add to library", weight="medium", color=INK),
+                rx.text("or drop a file here", size="2", color=MUTED),
+                spacing="1",
+                align="center",
+            ),
+            id="library_upload",
+            multiple=True,
+            border=f"1.5px dashed {BORDER}",
+            padding="1.5em",
+            border_radius="10px",
+            background="white",
+        ),
+ 
+        rx.button(
+            "Save to library",
+            on_click=State.handle_library_upload(rx.upload_files(upload_id="library_upload")),
+            background=DARK_BTN,
+            color="white",
+            border_radius="6px",
+        ),
+ 
+        rx.foreach(State.library, library_item_row),
+ 
+        width="100%",
+        align="start",
+        spacing="3",
+        padding="1.5em",
+        background="white",
+        border=f"1px solid {BORDER}",
+        border_radius="12px",
         margin_bottom="1em",
     )
 
-def dashboard_row(row: DashboardRow) -> rx.Component:
+def dashboard_row(row) -> rx.Component:
     return rx.box(
         rx.hstack(
             rx.vstack(
-                rx.text(row.filename, weight="bold"),
-                rx.badge(row.task_type, color_scheme="blue", size="1"),
+                rx.text(row.filename, weight="medium", color=INK),
+                rx.text(f"{row.task_type} · {row.completion_text}", size="2", color=MUTED),
                 align="start",
                 spacing="1",
             ),
             rx.spacer(),
             rx.vstack(
-                rx.text(row.deadline, size="2", color="gray"),
-                rx.badge(
+                rx.text(
                     row.urgency_label,
-                    color_scheme=rx.cond(
+                    size="2",
+                    weight="medium",
+                    color=rx.cond(
                         (row.urgency_label == "Overdue") | (row.urgency_label == "Due today"),
-                        "red",
-                        "orange",
+                        DANGER,
+                        "#946200",
                     ),
-                    size="1",
                 ),
+                rx.text(row.deadline, size="1", color=MUTED),
                 align="end",
                 spacing="1",
             ),
             width="100%",
-        ),
-        rx.hstack(
-            rx.text(row.completion_text, size="2", weight="medium"),
-            rx.progress(value=row.completion_percent, width="60%"),
-            width="100%",
-            spacing="3",
             align="center",
         ),
         rx.cond(
             row.missing.length() > 0,
-            rx.vstack(
-                rx.text("Still missing:", size="2", weight="bold", color="red"),
+            rx.hstack(
+                rx.text("Missing:", size="1", color=MUTED),
                 rx.foreach(
                     row.missing,
-                    lambda m: rx.text(f"• {m}", size="2", color="red"),
+                    lambda m: rx.badge(m, color_scheme="red", variant="soft", size="1"),
                 ),
-                align="start",
-                spacing="1",
+                spacing="2",
+                wrap="wrap",
                 margin_top="0.5em",
             ),
         ),
         width="100%",
-        padding="1em",
-        border="1px solid #ddd",
-        border_radius="8px",
-        margin_bottom="0.75em",
-        cursor="pointer",
-        on_click=rx.call_script(
-            f"""
-            (function() {{
-                const target = document.getElementById("doc-{row.filename}");
-                if (target) {{
-                    target.scrollIntoView({{ behavior: "smooth", block: "start" }});
-                }}
-            }})()
-            """
-        ),
-        _hover={"background": "#f5f5f5"},
+        padding="1em 0",
+        border_bottom=f"1px solid {BORDER}",
     )
+
 
 def dashboard_section() -> rx.Component:
     return rx.cond(
         State.dashboard_rows.length() > 0,
         rx.vstack(
-            rx.heading("Task Dashboard", size="5"),
+            rx.heading("Your tasks", size="5", font_family=FONT_SERIF, color=INK),
             rx.text(
                 "All detected tasks, sorted by deadline urgency.",
                 size="2",
-                color="gray",
+                color=MUTED,
             ),
-            rx.foreach(State.dashboard_rows, dashboard_row),
+            rx.vstack(
+                rx.foreach(State.dashboard_rows, dashboard_row),
+                width="100%",
+                spacing="0",
+            ),
             width="100%",
             align="start",
             spacing="3",
             padding="1.5em",
-            border="1px solid #ddd",
-            border_radius="10px",
+            background="white",
+            border=f"1px solid {BORDER}",
+            border_radius="12px",
             margin_bottom="1em",
         ),
     )
@@ -1369,41 +1715,67 @@ def audit_log_section() -> rx.Component:
         ),
     )
 
-def result_card(item: FileResult, index: int) -> rx.Component:
+def result_card(item, index: int) -> rx.Component:
     return rx.box(
-        rx.text(item.filename, weight="bold", size="4"),
-
+        rx.hstack(
+            rx.vstack(
+                rx.text(item.filename, size="1", color=MUTED),
+                rx.heading(item.summary, size="5", font_family=FONT_SERIF, color=INK),
+                rx.badge(item.task_type, color_scheme="gray", variant="soft"),
+                align="start",
+                spacing="1",
+            ),
+            rx.spacer(),
+            rx.badge(
+                "deadline tracked",
+                color_scheme="amber",
+                variant="soft",
+                border_radius="16px",
+            ),
+            width="100%",
+            align="start",
+        ),
+ 
         rx.cond(
             item.extraction_success & item.analysis_success,
             rx.vstack(
-                rx.badge(item.task_type, color_scheme="blue"),
-                rx.text(item.summary),
                 rx.hstack(
-                    rx.text("Deadline:", weight="bold"),
-                    rx.text(item.deadline),
+                    rx.vstack(
+                        rx.text("deadline", size="1", color=MUTED),
+                        rx.text(item.deadline, weight="medium", color=INK),
+                        align="start",
+                        spacing="0",
+                    ),
+                    rx.vstack(
+                        rx.text("amount", size="1", color=MUTED),
+                        rx.text(item.amount, weight="medium", color=INK),
+                        align="start",
+                        spacing="0",
+                    ),
+                    spacing="6",
+                ),
+                rx.vstack(
+                    rx.text("eligible for", size="1", color=MUTED),
+                    rx.text(item.recipient_or_purpose, color=INK),
+                    align="start",
+                    spacing="0",
                 ),
                 rx.hstack(
-                    rx.text("Amount:", weight="bold"),
-                    rx.text(item.amount),
+                    rx.foreach(
+                        item.required_documents,
+                        lambda doc: rx.badge(doc, color_scheme="gray", variant="surface"),
+                    ),
+                    spacing="2",
+                    wrap="wrap",
                 ),
-                rx.hstack(
-                    rx.text("For:", weight="bold"),
-                    rx.text(item.recipient_or_purpose),
-                ),
-                rx.text("Required documents:", weight="bold"),
-                rx.foreach(
-                    item.required_documents,
-                    lambda doc: rx.text(f"• {doc}"),
-                ),
-                rx.text("Other details:", weight="bold"),
-                rx.text(item.key_details),
-
+                rx.text(item.key_details, size="2", color=MUTED),
+ 
                 draft_section(item, index),
                 requirements_section(item, index),
                 chat_section(item, index),
-
+ 
                 align="start",
-                spacing="2",
+                spacing="3",
                 width="100%",
             ),
             rx.callout(
@@ -1412,80 +1784,163 @@ def result_card(item: FileResult, index: int) -> rx.Component:
                 color_scheme="red",
             ),
         ),
-
+ 
         width="100%",
         padding="1.5em",
-        border="1px solid #ddd",
-        border_radius="10px",
+        background="white",
+        border=f"1px solid {BORDER}",
+        border_radius="12px",
         margin_bottom="1em",
         id=f"doc-{item.filename}",
     )
 
 
-def index() -> rx.Component:
-    return rx.container(
-        rx.color_mode.button(position="top-right"),
-        rx.vstack(
-            rx.heading("AdminAgent — Understand Your Documents", size="7"),
-            rx.text(
-                "Upload emails, PDFs, forms, or images. AI will extract and analyze what needs to be done.",
-                size="4",
-                color="gray",
-            ),
-
-            library_section(),
-            cv_builder_section(),
-            dashboard_section(),
-            command_bar_section(),
-
-            rx.upload(
-                rx.vstack(
-                    rx.button("Select Files", type="button"),
-                    rx.text("or drag and drop files here"),
-                ),
-                id="upload1",
-                multiple=True,
-                accept={
-                    "application/pdf": [".pdf"],
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
-                    "image/png": [".png"],
-                    "image/jpeg": [".jpg", ".jpeg"],
-                    "message/rfc822": [".eml"],
-                    "application/vnd.ms-outlook": [".msg"],
-                },
-                border="2px dashed #ccc",
-                padding="3em",
-                border_radius="10px",
-            ),
-
-            rx.button(
-                "Upload & Analyze",
-                on_click=State.handle_upload(rx.upload_files(upload_id="upload1")),
-                loading=State.is_processing,
-            ),
-
-            rx.foreach(
-                State.results,
-                lambda item, i: result_card(item, i),
-            ),
-
-            rx.cond(
-                State.results.length() >= 2,
-                multi_chat_section(),
-            ),
-
-            audit_log_section(),
-
-            spacing="5",
-            justify="center",
-            align="center",
-            min_height="85vh",
-            padding="2em",
-            width="100%",
-            max_width="800px",
+def nav_tab(label: str, icon: str, target: str, active: bool = False) -> rx.Component:
+    return rx.hstack(
+        rx.icon(icon, size=16, color=INK if active else MUTED),
+        rx.text(
+            label,
+            size="2",
+            weight="medium" if active else "regular",
+            color=INK if active else MUTED,
+        ),
+        spacing="2",
+        align="center",
+        width="100%",
+        padding="0.5em 0.75em",
+        border_radius="6px",
+        background=CREAM_DARK if active else "white",
+        border=f"1px solid {CREAM_DARK if active else 'rgba(0,0,0,0.12)'}",
+        box_shadow="0 1px 0 rgba(0,0,0,0.04)",
+        cursor="pointer",
+        _hover={"background": CREAM_DARK},
+        transition="background 0.15s ease",
+        on_click=rx.call_script(
+            f"document.getElementById('{target}')"
+            f"?.scrollIntoView({{behavior: 'smooth', block: 'start'}})"
         ),
     )
 
 
+def sidebar() -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.icon("layout-dashboard", size=18, color=INK),
+            rx.text("Docket", weight="bold", font_family=FONT_SERIF, size="4"),
+            spacing="2",
+            align="center",
+            padding="0.25em",
+        ),
+        rx.vstack(
+            nav_tab("Home", "layout-dashboard", "home", active=True),
+            nav_tab("Assistant", "message-circle", "assistant"),
+            nav_tab("Tasks", "list-checks", "tasks"),
+            nav_tab("Library", "folder", "library"),
+            spacing="2",
+            align="start",
+            width="100%",
+        ),
+        spacing="4",
+        align="start",
+        width="190px",
+        min_width="190px",
+        padding="1.25em",
+        background=CREAM,
+        height="100%",
+    )
+
+
+def index() -> rx.Component:
+    return rx.box(
+        rx.color_mode.button(position="top-right"),
+        rx.hstack(
+            sidebar(),
+            rx.vstack(
+                rx.box(
+                    rx.vstack(
+                        rx.heading(
+                            "Every form, tracked. Every deadline, met.",
+                            size="8",
+                            font_family=FONT_SERIF,
+                            color=INK,
+                        ),
+                        rx.text(
+                            "Upload a document once. Docket reads it, pulls out "
+                            "what's required, and checks it against what's already in your library.",
+                            size="4",
+                            color=MUTED,
+                        ),
+                        spacing="5",
+                        align="start",
+                    ),
+                    id="home",
+                    width="100%",
+                ),
+
+                rx.foreach(
+                    State.results,
+                    lambda item, i: result_card(item, i),
+                ),
+
+                rx.upload(
+                    rx.vstack(
+                        rx.text("Select files", weight="medium", color=INK),
+                        rx.text("or drag and drop files here", size="2", color=MUTED),
+                        spacing="1",
+                        align="center",
+                    ),
+                    id="upload1",
+                    multiple=True,
+                    accept={
+                        "application/pdf": [".pdf"],
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+                        "image/png": [".png"],
+                        "image/jpeg": [".jpg", ".jpeg"],
+                        "message/rfc822": [".eml"],
+                        "application/vnd.ms-outlook": [".msg"],
+                    },
+                    border=f"1.5px dashed {BORDER}",
+                    padding="2.5em",
+                    border_radius="12px",
+                    background="white",
+                ),
+
+                rx.button(
+                    "Upload & analyze",
+                    on_click=State.handle_upload(rx.upload_files(upload_id="upload1")),
+                    loading=State.is_processing,
+                    background=DARK_BTN,
+                    color="white",
+                    border_radius="6px",
+                ),
+
+                rx.box(library_section(), id="library", width="100%"),
+                rx.box(assistant_section(), id="assistant", width="100%"),
+                cv_builder_section(),
+                rx.box(dashboard_section(), id="tasks", width="100%"),
+                command_bar_section(),
+
+                rx.cond(
+                    State.results.length() >= 2,
+                    multi_chat_section(),
+                ),
+
+                audit_log_section(),
+
+                spacing="5",
+                align="start",
+                width="100%",
+                max_width="800px",
+                padding="2.5em",
+            ),
+            spacing="0",
+            align="start",
+            width="100%",
+        ),
+        width="100%",
+        min_height="100vh",
+        background=CREAM,
+    )
+
 app = rx.App()
-app.add_page(index)
+app.add_page(index, title="Docket", on_load=State.load_library)

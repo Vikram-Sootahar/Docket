@@ -7,6 +7,8 @@ Takes the analysis from ai_reasoning.py and generates a usable draft
 
 import os
 import json
+import re
+import html
 from gemini_retry import generate_with_retry
 from dotenv import load_dotenv
 from google import genai
@@ -26,6 +28,7 @@ def generate_reply_draft(original_text: str, analysis: dict) -> dict:
     if not original_text or not original_text.strip():
         return {"success": False, "error": "No original text provided."}
 
+    analysis = analysis or {}
     prompt = f"""You are an assistant helping a user draft a reply to the following message.
 
 ORIGINAL MESSAGE:
@@ -42,10 +45,8 @@ Respond with ONLY the draft reply text, nothing else — no subject line, no exp
 """
 
     try:
-        response = generate_with_retry(
-            contents=prompt
-    )
-        draft = response.text.strip()
+        response = generate_with_retry(contents=prompt)
+        draft = response.text.strip() if response and hasattr(response, "text") else ""
 
         if not draft:
             return {"success": False, "error": "AI returned an empty draft."}
@@ -66,6 +67,13 @@ def generate_cover_letter(cv_text: str, job_text: str, job_analysis: dict) -> di
     if not job_text or not job_text.strip():
         return {"success": False, "error": "No job posting text provided."}
 
+    job_analysis = job_analysis or {}
+    req_docs = job_analysis.get("required_documents", [])
+    if isinstance(req_docs, list):
+        req_str = ", ".join(str(d) for d in req_docs)
+    else:
+        req_str = str(req_docs)
+
     prompt = f"""You are an assistant helping a user write a tailored cover letter for a job application.
 
 CANDIDATE'S CV/BACKGROUND:
@@ -76,7 +84,7 @@ JOB POSTING:
 
 CONTEXT (extracted analysis of the job posting):
 - Role/Purpose: {job_analysis.get('recipient_or_purpose', '')}
-- Requirements: {', '.join(job_analysis.get('required_documents', []))}
+- Requirements: {req_str}
 
 Write a professional, tailored cover letter (4-6 short paragraphs) that:
 1. Connects the candidate's actual background/skills (from the CV above) to the job requirements
@@ -88,11 +96,8 @@ Respond with ONLY the cover letter text, nothing else — no subject line, no ex
 """
 
     try:
-        response = generate_with_retry(
-            model="gemini-3.6-flash",
-            contents=prompt
-        )
-        draft = response.text.strip()
+        response = generate_with_retry(contents=prompt)
+        draft = response.text.strip() if response and hasattr(response, "text") else ""
 
         if not draft:
             return {"success": False, "error": "AI returned an empty cover letter."}
@@ -100,12 +105,12 @@ Respond with ONLY the cover letter text, nothing else — no subject line, no ex
         return {"success": True, "draft": draft}
 
     except Exception as e:
-
         return {"success": False, "error": f"Cover letter generation failed: {str(e)}"}
+
 
 def save_draft_as_pdf(draft_text: str, output_path: str) -> dict:
     """
-    Saves a draft text as a formatted PDF file.
+    Saves a draft text as a formatted PDF file using ReportLab.
     Returns: {"success": True, "path": "..."} or {"success": False, "error": "..."}
     """
     if not draft_text or not draft_text.strip():
@@ -120,42 +125,16 @@ def save_draft_as_pdf(draft_text: str, output_path: str) -> dict:
         for para in paragraphs:
             para = para.strip()
             if para:
-                para_html = para.replace("\n", "<br/>")
-                story.append(Paragraph(para_html, styles["Normal"]))
+                # Escape XML special characters to prevent ReportLab parsing crash
+                para_escaped = html.escape(para).replace("\n", "<br/>")
+                story.append(Paragraph(para_escaped, styles["Normal"]))
                 story.append(Spacer(1, 12))
 
         doc.build(story)
-
         return {"success": True, "path": output_path}
 
     except Exception as e:
         return {"success": False, "error": f"PDF generation failed: {str(e)}"}
-
-def generate_financial_declaration(data: dict) -> dict:
-    """
-    Fills a generic financial declaration template using provided data.
-    Expected keys in data: name, cnic, amount, purpose, date, place
-    Returns: {"success": True, "text": "..."} or {"success": False, "error": "..."}
-    """
-    required_fields = ["name", "cnic", "amount", "purpose", "date", "place"]
-    missing = [f for f in required_fields if not data.get(f)]
-
-    if missing:
-        return {"success": False, "error": f"Missing required fields: {', '.join(missing)}"}
-
-    declaration_text = f"""FINANCIAL DECLARATION
-
-I, {data['name']}, holder of CNIC No. {data['cnic']}, hereby declare that the amount of {data['amount']} is being submitted/utilized for the purpose of: {data['purpose']}.
-
-I affirm that the above information is true and correct to the best of my knowledge, and I take full responsibility for its accuracy.
-
-Place: {data['place']}
-Date: {data['date']}
-
-Signature: _______________________
-{data['name']}"""
-
-    return {"success": True, "text": declaration_text}
 
 
 def extract_cv_fields(cv_text: str) -> dict:
@@ -184,23 +163,23 @@ Return ONLY a valid JSON object with these exact keys:
 Respond with ONLY the JSON object, nothing else — no markdown formatting, no explanation.
 """
 
+    raw_text = ""
     try:
-        response = generate_with_retry(
-            model="gemini-3.6-flash",
-            contents=prompt
-        )
-        raw_text = response.text.strip()
+        response = generate_with_retry(contents=prompt)
+        raw_text = (response.text if response and hasattr(response, "text") else "").strip()
 
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if json_match:
+            raw_text = json_match.group(0)
 
         fields = json.loads(raw_text)
-
         return {"success": True, "fields": fields}
 
     except json.JSONDecodeError:
-        return {"success": False, "error": "AI did not return valid JSON."}
+        return {"success": False, "error": "AI did not return valid JSON.", "raw": raw_text}
     except Exception as e:
         return {"success": False, "error": f"CV field extraction failed: {str(e)}"}
+
 
 def preview_draft(draft_text: str, draft_type: str = "Document") -> None:
     """
@@ -215,6 +194,7 @@ def preview_draft(draft_text: str, draft_type: str = "Document") -> None:
     print(draft_text)
     print(separator)
     print("Status: Awaiting approval\n")
+
 
 def review_draft(draft_text: str, draft_type: str = "Document") -> dict:
     """
@@ -247,24 +227,48 @@ def review_draft(draft_text: str, draft_type: str = "Document") -> dict:
         else:
             print("Invalid choice. Please type A, E, or R.\n")
 
+
 def generate_financial_declaration(analysis: dict, declarant_name: str = "[YOUR NAME]") -> dict:
     """
-    Generates a generic financial declaration / form document using template logic.
-    No AI call - pure template fill based on already-extracted analysis data.
+    Generates a financial declaration form using template logic.
+    Handles both direct data dicts and task analysis dicts.
     Returns: {"success": bool, "draft": str, "error": str}
     """
     try:
-        task_type = analysis.get("task_type", "N/A")
-        summary = analysis.get("summary", "N/A")
-        deadline = analysis.get("deadline", "N/A")
-        amount = analysis.get("amount", "N/A")
-        recipient = analysis.get("recipient_or_purpose", "N/A")
-        required_documents = analysis.get("required_documents", [])
-        key_details = analysis.get("key_details", "N/A")
+        analysis = analysis or {}
 
-        docs_list = "\n".join(f"  - {doc}" for doc in required_documents) if required_documents else "  - None specified"
+        # If direct data dict passed (with CNIC)
+        if "cnic" in analysis or "place" in analysis:
+            name = analysis.get("name") or declarant_name
+            cnic = analysis.get("cnic", "[CNIC NOT PROVIDED]")
+            amount = analysis.get("amount", "[AMOUNT NOT SPECIFIED]")
+            purpose = analysis.get("purpose") or analysis.get("recipient_or_purpose", "[PURPOSE NOT SPECIFIED]")
+            date_str = analysis.get("date", "[TODAY'S DATE]")
+            place = analysis.get("place", "[LOCATION]")
 
-        form_text = f"""FINANCIAL / GENERIC DECLARATION FORM
+            form_text = f"""FINANCIAL DECLARATION
+
+I, {name}, holder of CNIC No. {cnic}, hereby declare that the amount of {amount} is being submitted/utilized for the purpose of: {purpose}.
+
+I affirm that the above information is true and correct to the best of my knowledge, and I take full responsibility for its accuracy.
+
+Place: {place}
+Date: {date_str}
+
+Signature: _______________________
+{name}"""
+        else:
+            task_type = analysis.get("task_type", "N/A")
+            summary = analysis.get("summary", "N/A")
+            deadline = analysis.get("deadline", "N/A")
+            amount = analysis.get("amount", "N/A")
+            recipient = analysis.get("recipient_or_purpose", "N/A")
+            required_documents = analysis.get("required_documents", [])
+            key_details = analysis.get("key_details", "N/A")
+
+            docs_list = "\n".join(f"  - {doc}" for doc in required_documents) if required_documents else "  - None specified"
+
+            form_text = f"""FINANCIAL / GENERIC DECLARATION FORM
 {"=" * 45}
 
 Declarant Name: {declarant_name}
@@ -302,12 +306,22 @@ Date: ___________________________
     except Exception as e:
         return {"success": False, "draft": "", "error": str(e)}
 
+
 def generate_application_form(cv_fields: dict, job_analysis: dict) -> dict:
     """
     Fills a generic job application form using parsed CV fields and job document analysis.
     No AI call - pure template fill logic.
     """
     try:
+        cv_fields = cv_fields or {}
+        job_analysis = job_analysis or {}
+
+        name = cv_fields.get("full_name") or cv_fields.get("name", "[NAME NOT FOUND]")
+        email_val = cv_fields.get("email", "[EMAIL NOT FOUND]")
+        phone_val = cv_fields.get("phone", "[PHONE NOT FOUND]")
+        linkedin = cv_fields.get("linkedin", "[LINKEDIN NOT FOUND]")
+        github = cv_fields.get("github", "[GITHUB NOT FOUND]")
+
         job_type = job_analysis.get("task_type", "N/A")
         summary = job_analysis.get("summary", "N/A")
         deadline = job_analysis.get("deadline", "N/A")
@@ -320,11 +334,11 @@ def generate_application_form(cv_fields: dict, job_analysis: dict) -> dict:
 {"=" * 45}
 
 Applicant Information (auto-filled from your CV):
-  Full Name:   {cv_fields.get('name', '[NAME NOT FOUND]')}
-  Email:       {cv_fields.get('email', '[EMAIL NOT FOUND]')}
-  Phone:       {cv_fields.get('phone', '[PHONE NOT FOUND]')}
-  LinkedIn:    {cv_fields.get('linkedin', '[LINKEDIN NOT FOUND]')}
-  GitHub:      {cv_fields.get('github', '[GITHUB NOT FOUND]')}
+  Full Name:   {name}
+  Email:       {email_val}
+  Phone:       {phone_val}
+  LinkedIn:    {linkedin}
+  GitHub:      {github}
 
 Application For: {job_type}
 Position / Purpose: {recipient}

@@ -2,7 +2,7 @@
 file_readers.py
 
 Reusable functions to extract text from different file types:
-PDF, DOCX, Images (OCR), EML (email), and MSG (Outlook email).
+PDF, DOCX, Images (OCR), EML (email), MSG (Outlook email), and Text (.txt/.md).
 
 Each function returns a dict:
   {"success": True, "text": "...", ...}   on success
@@ -181,6 +181,24 @@ def extract_msg_text(file_path):
         return {"success": False, "error": f"Could not read .msg file: {str(e)}"}
 
 
+def extract_txt_text(file_path):
+    """Takes a .txt or .md file path and returns the extracted text."""
+    if not os.path.exists(file_path):
+        return {"success": False, "error": f"File not found: {file_path}"}
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+
+        if not text.strip():
+            return {"success": False, "error": "Text file is empty."}
+
+        return {"success": True, "text": text}
+
+    except Exception as e:
+        return {"success": False, "error": f"Could not read text file: {str(e)}"}
+
+
 def extract_text_from_file(file_path):
     """
     Master function — automatically detects file type from extension
@@ -192,6 +210,8 @@ def extract_text_from_file(file_path):
         return extract_pdf_text(file_path)
     elif ext == "docx":
         return extract_docx_text(file_path)
+    elif ext in ("txt", "md", "text", "log", "csv"):
+        return extract_txt_text(file_path)
     elif ext in ("png", "jpg", "jpeg", "bmp", "tiff"):
         return extract_image_text(file_path)
     elif ext == "eml":

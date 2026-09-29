@@ -2,6 +2,7 @@
 and can trigger a few safe actions. It never approves, submits, pays or sends anything."""
 
 import json
+import re
 
 from gemini_retry import generate_with_retry
 
@@ -31,13 +32,15 @@ Return ONLY valid JSON: {"reply": "<text>", "action": "<none|check_documents|gen
 
 def assistant_reply(user_text: str, context: str, history: list[dict], filenames: list[str], audio_bytes: bytes = None) -> dict:
     """history: list of {"role": "user" | "assistant", "text": str}."""
+    text = ""
     try:
         from google.genai import types
 
         history_text = ""
         for turn in (history or [])[-8:]:
-            who = "User" if turn.get("role") == "user" else "Assistant"
-            history_text += f"{who}: {turn.get('text', '')}\n"
+            if isinstance(turn, dict):
+                who = "User" if turn.get("role") == "user" else "Assistant"
+                history_text += f"{who}: {turn.get('text', '')}\n"
 
         if audio_bytes:
             user_part = "The user's new message is spoken in the attached audio. Listen to it and answer it."
@@ -54,20 +57,22 @@ def assistant_reply(user_text: str, context: str, history: list[dict], filenames
             contents=contents,
             config=types.GenerateContentConfig(response_mime_type="application/json"),
         )
-        text = (response.text or "").strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
+        text = (response.text if response and hasattr(response, "text") else "").strip()
+
+        # Robust JSON extraction
+        json_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
         data = json.loads(text)
 
         reply = str(data.get("reply", "")).strip()
-        action = data.get("action", "none")
-        filename = data.get("filename", "") or ""
+        action = str(data.get("action", "none"))
+        filename = str(data.get("filename", "") or "").strip()
 
         if action not in ACTIONS:
             action = "none"
-        if action in NEEDS_FILENAME and filename not in filenames:
+        if action in NEEDS_FILENAME and filename not in (filenames or []):
             action = "none"
             filename = ""
         if not reply:
