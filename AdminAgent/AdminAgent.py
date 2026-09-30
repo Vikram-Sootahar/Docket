@@ -1001,7 +1001,7 @@ VOICE_START_JS = """
     rec.ondataavailable = function (e) {
       if (e.data && e.data.size > 0) { v.chunks.push(e.data); }
     };
-    rec.start();
+    rec.start();ws
     v.timer = setInterval(function () {
       const secs = Math.floor((Date.now() - v.start) / 1000);
       const el = document.getElementById('rec-timer');

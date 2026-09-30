@@ -86,7 +86,7 @@ Every uploaded document flows through the same pipeline: **extract → understan
 
 ```bash
 # 1. Clone the repository
-git clone <your-repo-url>
+git clone https://github.com/Vikram-Sootahar/Docket.git
 cd docket
 
 # 2. Create and activate a virtual environment
